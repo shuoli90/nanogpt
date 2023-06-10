@@ -2,13 +2,17 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-batch_size = 32
-block_size = 8
+batch_size = 64
+block_size = 256
 max_iters = 5000
 eval_interval = 500
-learning_rate = 0.001
+learning_rate = 3e-4
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_iters = 200
+n_layer = 6
+dropout = 0.2
+n_head = 6
+n_embed = 384
 
 with open('input.txt', 'r') as f:
     text = f.read()
@@ -17,7 +21,6 @@ chars = sorted(list(set(text)))
 print('number of unique characters:', len(chars))
 print("".join(chars))
 vocab_size = len(chars)
-n_embed = 32
 
 stoi = {ch: i for i, ch in enumerate(chars)}
 itos = {i: ch for i, ch in enumerate(chars)}
@@ -36,18 +39,15 @@ n = int(0.9 * len(data))
 train_data = data[:n]
 val_data = data[n:]
 
-block_size = 8
 
 x = train_data[:block_size]
 y = train_data[1:block_size+1]
-for t in range(block_size):
-    context = x[:t+1]
-    target = y[t]
-    print('t =', t, 'context =', context, 'target =', target)
+# for t in range(block_size):
+    # context = x[:t+1]
+    # target = y[t]
+    # print('t =', t, 'context =', context, 'target =', target)
 
 torch.manual_seed(1337)
-batch_size = 4
-block_size = 8
 
 def get_batch(split):
     data = train_data if split == 'train' else val_data
@@ -72,7 +72,6 @@ def estimate_loss():
     return out
 
 xb, yb = get_batch('train')
-print(xb.shape, yb.shape)
 
 import torch
 import torch.nn as nn
@@ -88,6 +87,7 @@ class Head(nn.Module):
         self.query = nn.Linear(n_embed, head_size, bias=False)
         self.value = nn.Linear(n_embed, head_size, bias=False)
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+        self.dropout = nn.Dropout(dropout)
     
     def forward(self, x):
         B, T, C = x.shape
@@ -96,6 +96,7 @@ class Head(nn.Module):
         wei = q @ k.transpose(-2, -1) * C**-0.5
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
         wei = F.softmax(wei, dim=-1)
+        wei = self.dropout(wei)
         v = self.value(x)
         out = wei @ v #(B, T, H)
         return out
@@ -105,10 +106,12 @@ class MultiHeadAttention(nn.Module):
         super().__init__()
         self.heads = nn.ModuleList((Head(head_size) for _ in range(n_heads)))
         self.proj = nn.Linear(n_embed, n_embed)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         out = torch.cat([h(x) for h in self.heads], dim=-1)
         out = self.proj(out)
+        out = self.dropout(out)
         return out
 
 class FeedForward(nn.Module):
@@ -117,7 +120,8 @@ class FeedForward(nn.Module):
         self.net = nn.Sequential(
             nn.Linear(n_embed, n_embed),
             nn.ReLU(),
-            nn.Linear(n_embed, n_embed)
+            nn.Linear(n_embed, n_embed),
+            nn.Dropout(dropout)
         )
     
     def forward(self, x):
@@ -144,8 +148,8 @@ class Block(nn.Module):
         super().__init__()
         self.at_head = MultiHeadAttention(n_head, n_embed//n_head)
         self.ffwd = FeedForward(n_embed)
-        self.ln1 = LayerNorm(n_embed)
-        self.ln2 = LayerNorm(n_embed)
+        self.ln1 = nn.LayerNorm(n_embed)
+        self.ln2 = nn.LayerNorm(n_embed)
     
     def forward(self, x):
         x = x + self.at_head(self.ln1(x))
@@ -158,31 +162,29 @@ class BigramLanguageModel(nn.Module):
         super().__init__()
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
         self.position_embedding_table = nn.Embedding(block_size, n_embed)
-        self.blocks = nn.Sequential(
-            Block(n_embed, n_head=4),
-            Block(n_embed, n_head=4),
-            Block(n_embed, n_head=4),
-        )
-        self.ln = LayerNorm(n_embed)
+        self.blocks = nn.Sequential(*[Block(n_embed, n_head=n_head) for _ in range(n_layer)])
+        self.ln = nn.LayerNorm(n_embed)
         self.lm_head = nn.Linear(n_embed, vocab_size)
-    
+
     def forward(self, idx, targets=None):
+        B, T = idx.shape
 
-        tok_emb = self.token_embedding_table(idx) #(B, T, C)
-        pos_emb = self.position_embedding_table(torch.arange(block_size).to(tok_emb.device)) #(T, C)
-        x = tok_emb + pos_emb #(B, T, C)
-        x = self.blocks(x) #(B, T, C)
-        x = self.ln(x) #(B, T, C)
-        logits = self.lm_head(x) #(B, T, V)
+        # idx and targets are both (B,T) tensor of integers
+        tok_emb = self.token_embedding_table(idx) # (B,T,C)
+        pos_emb = self.position_embedding_table(torch.arange(T, device=device)) # (T,C)
+        x = tok_emb + pos_emb # (B,T,C)
+        x = self.blocks(x) # (B,T,C)
+        x = self.ln(x) # (B,T,C)
+        logits = self.lm_head(x) # (B,T,vocab_size)
 
-        B, T, C = logits.shape
-        if targets != None:
+        if targets is None:
+            loss = None
+        else:
+            B, T, C = logits.shape
             logits = logits.view(B*T, C)
             targets = targets.view(B*T)
-            loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), targets.view(-1)) 
-            return logits, loss
-        else:
-            return logits, None
+            loss = F.cross_entropy(logits, targets)
+        return logits, loss
 
     def generate(self, idx, n):
         for _ in range(n):
@@ -191,22 +193,17 @@ class BigramLanguageModel(nn.Module):
             logits = logits[:, -1, :]
             probs = F.softmax(logits, dim=-1)
             idx_next = torch.multinomial(probs, num_samples=1)
-            idx = torch.cat([idx, idx_next], dim=-1)
+            idx = torch.cat((idx, idx_next), dim=1)
         return idx
-
-
 
 
 model = BigramLanguageModel()
 model = model.to(device)
 out, loss = model(xb, yb)
-print(out.shape)
-print(loss)
-print(decode(model.generate(idx=torch.zeros((1,32), dtype=torch.long).to(device), n=100)[0].tolist()))
+print(decode(model.generate(idx=torch.zeros((1,1), dtype=torch.long).to(device), n=100)[0].tolist()))
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
-batch = 4
 for iter in range(max_iters):
 
     if iter % eval_interval == 0:
@@ -220,4 +217,4 @@ for iter in range(max_iters):
     optimizer.step()
 
 print(loss.item())
-print(decode(model.generate(idx=torch.zeros((1,32), dtype=torch.long).to(device), n=100)[0].tolist()))
+print(decode(model.generate(idx=torch.zeros((1,1), dtype=torch.long).to(device), n=100)[0].tolist()))
