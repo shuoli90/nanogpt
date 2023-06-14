@@ -217,4 +217,4 @@ for iter in range(max_iters):
     optimizer.step()
 
 print(loss.item())
-print(decode(model.generate(idx=torch.zeros((1,1), dtype=torch.long).to(device), n=100)[0].tolist()))
+print(decode(model.generate(idx=torch.zeros((1,1), dtype=torch.long).to(device), n=500)[0].tolist()))
